@@ -72,9 +72,9 @@ In groups of 2, you will be investigating, developing and testing your algorithm
 
 ![scenario1](docs/schematic.png)
 
-## Hardware Challenge Event at HereEast 26th March
+## Hardware Challenge Event at HereEast on 16th and 23rd March
 
-In your groups, you will be given the opportunity to run a viable solution on real crazyflies on the 26th March and / or 2nd April at UCL HereEast - this is an optional non-assessed task.
+In your groups, you will be given the opportunity to run a viable solution on real crazyflies.
 
 I encourage as many groups as possible to join the event. We will be maintaining a leaderboard and points will be awarded based on success rate, reconfigurablity and time taken. A sign up sheet will be provided.
 
