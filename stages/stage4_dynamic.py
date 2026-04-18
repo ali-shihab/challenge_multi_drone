@@ -403,6 +403,7 @@ def _run_traversal(
     if verbose:
         print("[Stage 4] Moving to entry in columnN formation…")
     conductor.set_all_leds("orange")
+
     conductor.goto_formation(
         centroid_xyz=[start_xy[0], start_xy[1], z],
         heading_rad=init_heading,
@@ -437,6 +438,7 @@ def _run_traversal(
 
         centroid    = conductor.get_centroid()
         centroid_xy = centroid[:2]
+        leader_xy   = conductor.drones[0].xyz[:2]  # [LEADER FIX] column ref point
 
         # ---- Check whether a fresh plan is needed before this step ----
         time_since = time.time() - last_replan
@@ -448,16 +450,16 @@ def _run_traversal(
                     f"{time_since:.1f} s since last plan."
                 )
             new_path = _plan_rrt(
-                centroid_xy, goal_xy, z,
+                leader_xy, goal_xy, z,
                 tracker, stage_cfg, stage_size,
                 OBSTACLE_INFLATION,
             )
             if new_path and len(new_path) >= 2:
                 path        = new_path
-                wp_idx      = 0
+                wp_idx      = min(1, len(path) - 1)  # [LEADER FIX] skip current-pos waypoint
                 last_replan = time.time()
-                wp          = path[0]
-                next_wp     = path[1] if len(path) > 1 else None
+                wp          = path[wp_idx]
+                next_wp     = path[wp_idx + 1] if wp_idx + 1 < len(path) else None
                 if verbose:
                     print(f"[Stage 4]   New path: {len(path)} waypoints.")
 
@@ -469,6 +471,17 @@ def _run_traversal(
                 speed=speed,
                 yaw_mode=YawMode.PATH_FACING,
             )
+        # [IDLE RACE FIX] wait for all drones to leave IDLE before
+        # trusting a later idle signal as "arrived".
+        _start_deadline = time.time() + 1.0
+        while time.time() < _start_deadline:
+            if not any(d.behaviour_idle() for d in conductor.drones):
+                break
+            time.sleep(0.02)
+        else:
+            if verbose:
+                _idle = [d.behaviour_idle() for d in conductor.drones]
+                print(f"[Stage 4]   WARN: drones did not leave idle in 1s: {_idle}")
 
         # ---- Wait for arrival, allowing mid-flight interrupt ----------
         deadline    = time.time() + WAYPOINT_TIMEOUT
@@ -480,6 +493,7 @@ def _run_traversal(
 
             # Check for a close-approach interrupt
             centroid_xy = conductor.get_centroid()[:2]
+            leader_xy   = conductor.drones[0].xyz[:2]  # [LEADER FIX]
             closest     = _closest_obstacle_m(centroid_xy, tracker)
 
             if closest <= REPLAN_TRIGGER_CLOSE:
@@ -489,19 +503,19 @@ def _run_traversal(
                         f"obstacle at {closest:.2f} m."
                     )
                 new_path = _plan_rrt(
-                    centroid_xy, goal_xy, z,
+                    leader_xy, goal_xy, z,
                     tracker, stage_cfg, stage_size,
                     OBSTACLE_INFLATION,
                 )
                 if new_path and len(new_path) >= 2:
                     path        = new_path
-                    wp_idx      = -1   # will become 0 after the outer increment
+                    wp_idx      = min(1, len(path) - 1)  # [LEADER FIX] skip current-pos waypoint
                     last_replan = time.time()
                     interrupted = True
 
                     # Issue replacement commands immediately
-                    new_wp   = path[0]
-                    new_next = path[1] if len(path) > 1 else None
+                    new_wp   = path[wp_idx]
+                    new_next = path[wp_idx + 1] if wp_idx + 1 < len(path) else None
                     new_tgts = _column_targets(
                         new_wp, new_next, n, spacing, init_heading
                     )
@@ -511,6 +525,12 @@ def _run_traversal(
                             speed=speed,
                             yaw_mode=YawMode.PATH_FACING,
                         )
+                    # [IDLE RACE FIX] wait for drones to leave idle.
+                    _mid_deadline = time.time() + 1.0
+                    while time.time() < _mid_deadline:
+                        if not any(d.behaviour_idle() for d in conductor.drones):
+                            break
+                        time.sleep(0.02)
                     if verbose:
                         print(
                             f"[Stage 4]   Emergency path: "
@@ -537,3 +557,7 @@ def _run_traversal(
         speed=speed,
     )
     conductor.set_formation_leds("line")
+
+# [LEADER FIX applied]
+
+# [IDLE RACE FIX applied]
