@@ -1,5 +1,10 @@
 #!/bin/bash
-set +e 
+set +e
+
+# Ensure any previous Gazebo/ign processes are dead before starting a new session.
+# This prevents stale world entities accumulating across restarts.
+pkill -9 -f 'ign gazebo' 2>/dev/null; pkill -9 -f 'ruby.*ign' 2>/dev/null
+sleep 2  # allow OS to reclaim sockets/ports before new Gazebo starts
 
 usage() {
     echo "  options:"
@@ -87,6 +92,9 @@ if [[ ${launch_simulation} == "true" ]]; then
     export GZ_SIM_RESOURCE_PATH=$GZ_SIM_RESOURCE_PATH:"${config_folder}/gazebo/models":"${config_folder}/gazebo/worlds":"${config_folder}/gazebo/plugins":"${simulation_config_folder}/models"
     export IGN_GAZEBO_RESOURCE_PATH=$IGN_GAZEBO_RESOURCE_PATH:"${config_folder}/gazebo/models":"${config_folder}/gazebo/worlds":"${config_folder}/gazebo/plugins":"${simulation_config_folder}/models"
     export AS2_EXTRA_DRONE_MODELS=crazyflie_led_ring
+    # Plugin paths for custom Ignition Gazebo plugins (led_ring, dynamic_moving_objects)
+    export GZ_SIM_SYSTEM_PLUGIN_PATH=$GZ_SIM_SYSTEM_PLUGIN_PATH:"${SCRIPT_DIR}/../../install/led_ring_plugin/lib":"${SCRIPT_DIR}/../../install/dynamic_moving_objects/lib"
+    export IGN_GAZEBO_PLUGIN_PATH=$IGN_GAZEBO_PLUGIN_PATH:"${SCRIPT_DIR}/../../install/led_ring_plugin/lib":"${SCRIPT_DIR}/../../install/dynamic_moving_objects/lib"
 
     # Set the world configuration
     if [ -z "$world_config" ]; then
@@ -147,6 +155,19 @@ for namespace in ${drone_namespaces[@]}; do
 
   sleep 0.2 # Wait for tmuxinator to finish
 done
+
+# [respawn auto-invoke] launch_simulation.py fires 21 parallel ros_gz_sim
+# create processes that race Gazebo's /world/<name>/create service; under
+# load many requests are silently dropped even though the create CLI
+# prints OK. utils/respawn_missing.py waits for /clock, wipes partial
+# spawns and re-spawns every model from world.yaml serially. Run it in
+# its own tmux window so the output is visible and can be inspected.
+# [respawn auto-invoke] — spawn missing models after launch_simulation races
+if [[ ${launch_simulation} == "true" && ${use_multicopter} == "false" && ${use_gnome} == "false" ]]; then
+  _first_ns="${drone_namespaces[0]}"
+  tmux new-window -t "${_first_ns}" -n respawn \
+    "bash ${SCRIPT_DIR}/utils/respawn_wrapper.sh ${_first_ns}"
+fi
 
 # Attach to tmux session
 if [[ ${use_gnome} == "false" ]]; then
