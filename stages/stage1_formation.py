@@ -133,6 +133,13 @@ def run_stage1(conductor: SwarmConductor,
     conductor.set_formation_leds("columnN")
 
     # --- Main loop: fly the circle, changing formation periodically -------
+    # [STAGE1 PIPELINE] We dispatch each waypoint non-blocking and wait
+    # only for proximity (not full IDLE), so the swarm never stops
+    # between waypoints. At CHANGE_EVERY=2 the drones have ~2 s of
+    # forward motion to settle into each new formation, comfortably
+    # more than the ~0.75 s needed to rearrange by FORMATION_SPACING.
+    PROX_TOL_M   = 0.7   # loose tolerance → smooth forward motion
+    PROX_TIMEOUT = 1.5    # per-waypoint proximity timeout (s)
     for lap in range(laps):
         if verbose:
             print(f"[Stage 1] Starting lap {lap + 1}/{laps}")
@@ -148,14 +155,25 @@ def run_stage1(conductor: SwarmConductor,
                           f"formation '{current_formation}'")
 
             heading = _tangent_heading(waypoints, wp_idx)
-            conductor.goto_formation(
+            targets = conductor.goto_formation(
                 centroid_xyz=waypoints[wp_idx],
                 heading_rad=heading,
                 formation=current_formation,
                 spacing=spacing,
                 speed=speed,
                 yaw_mode=YawMode.PATH_FACING,
+                wait=False,
             )
+            # "free" formation returns True (no-op) instead of a targets
+            # list. Skip the proximity wait in that case.
+            if isinstance(targets, list):
+                conductor.wait_near_positions(
+                    targets, tol_m=PROX_TOL_M, timeout=PROX_TIMEOUT,
+                )
 
     if verbose:
         print("[Stage 1] Complete.")
+
+# [STAGE1 RETUNE] applied: PROX_TOL_M 0.35 -> 0.7, PROX_TIMEOUT 4.0 -> 1.5.
+# Retargets now happen while drone is at cruise speed, before go_to
+# deceleration starts. See patch_stage1_retune.py rationale.

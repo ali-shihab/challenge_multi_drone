@@ -57,15 +57,39 @@ class SwarmConductor:
     #  Arm / mode                                                          #
     # ------------------------------------------------------------------ #
 
-    def arm_and_offboard(self) -> bool:
-        """Arm all drones and switch to offboard mode.
+    def arm_and_offboard(self, retries: int = 3, retry_delay: float = 1.0) -> bool:
+        """Arm all drones and switch to offboard mode, with retries.
 
         Returns True only if every drone succeeds at both steps.
         """
         ok = True
-        for drone in self.drones:
-            ok = drone.arm()      and ok
-            ok = drone.offboard() and ok
+        for idx, drone in enumerate(self.drones):
+            # Arm with retries
+            armed = False
+            for attempt in range(retries):
+                if drone.arm():
+                    armed = True
+                    break
+                time.sleep(retry_delay)
+            if not armed:
+                print(f"[SwarmConductor] drone{idx} failed to arm after {retries} attempts")
+                ok = False
+
+            time.sleep(0.5)
+
+            # Offboard with retries
+            offboarded = False
+            for attempt in range(retries):
+                if drone.offboard():
+                    offboarded = True
+                    break
+                time.sleep(retry_delay)
+            if not offboarded:
+                print(f"[SwarmConductor] drone{idx} failed to enter offboard after {retries} attempts")
+                ok = False
+
+            time.sleep(1.0)
+
         return ok
 
     # ------------------------------------------------------------------ #
@@ -103,7 +127,8 @@ class SwarmConductor:
                        speed: float = 1.0,
                        yaw_mode: int = YawMode.PATH_FACING,
                        yaw_angle: Optional[float] = None,
-                       timeout: float = 60.0) -> bool:
+                       timeout: float = 60.0,
+                       wait: bool = True):
         """Move every drone to its position within a formation.
 
         The formation is centred on *centroid_xyz* and oriented so that
@@ -145,6 +170,10 @@ class SwarmConductor:
                            yaw_mode=yaw_mode,
                            yaw_angle=yaw_angle)
 
+        if not wait:
+            # [STAGE1 PIPELINE] return targets so caller can run
+            # proximity-based wait instead of full-idle wait.
+            return targets
         return self.wait_all(timeout)
 
     def goto_positions(self,
@@ -152,7 +181,8 @@ class SwarmConductor:
                        speed: float = 1.0,
                        yaw_mode: int = YawMode.PATH_FACING,
                        yaw_angle: Optional[float] = None,
-                       timeout: float = 60.0) -> bool:
+                       timeout: float = 60.0,
+                       wait: bool = True):
         """Send each drone to an explicitly specified [x, y, z] position.
 
         *positions* must have the same length as the number of drones.
@@ -169,11 +199,48 @@ class SwarmConductor:
                            speed=speed,
                            yaw_mode=yaw_mode,
                            yaw_angle=yaw_angle)
+        if not wait:
+            return positions
         return self.wait_all(timeout)
 
     # ------------------------------------------------------------------ #
     #  Wait helpers                                                        #
     # ------------------------------------------------------------------ #
+
+    def wait_near_positions(self,
+                            targets: List[List[float]],
+                            tol_m: float = 0.30,
+                            timeout: float = 10.0) -> bool:
+        """Block until every drone is within tol_m (XY) of its target
+        position, or until timeout. Position-based (uses drone.xyz), so
+        unaffected by the brief IDLE window between cancel+restart of
+        cmd_goto — which means safe to call immediately after re-issuing
+        a go_to command in a pipelined loop.
+
+        Unlike wait_all (which polls behaviour_idle), this returns as
+        soon as drones are *close* — they can still be moving. Use a
+        looser tolerance for pipelining forward motion (e.g. 0.35 m) and
+        a tighter one for settling at a formation target (e.g. 0.15 m).
+        """
+        if len(targets) != self.n:
+            raise ValueError(
+                f"Expected {self.n} targets, got {len(targets)}"
+            )
+        deadline = time.time() + timeout
+        tol2 = tol_m * tol_m
+        while time.time() < deadline:
+            all_near = True
+            for drone, tgt in zip(self.drones, targets):
+                p = drone.xyz
+                dx = p[0] - tgt[0]
+                dy = p[1] - tgt[1]
+                if dx * dx + dy * dy > tol2:
+                    all_near = False
+                    break
+            if all_near:
+                return True
+            time.sleep(0.05)
+        return False
 
     def wait_all(self, timeout: float = 60.0) -> bool:
         """Block until every drone's active behaviour reaches IDLE.
@@ -191,16 +258,17 @@ class SwarmConductor:
     def wait_for_poses(self, timeout: float = 10.0) -> bool:
         """Block until all drones have published at least one pose.
 
-        The DroneInterfaceBase initialises position to [0, 0, 0], which
-        is indistinguishable from a drone genuinely at the origin.  We
-        instead wait until the z component is > 0 (drones spawn above
-        ground) as a proxy for a real pose update.
+        DroneInterfaceBase initialises position fields to NaN until the
+        first self_localization/pose message arrives.  We wait until every
+        drone's z is a real number (not NaN), which means pose data is
+        flowing regardless of the drone's actual height.
 
         Returns True when poses are available; False on timeout.
         """
+        import math
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if all(d.xyz[2] > 0.05 for d in self.drones):
+            if all(not math.isnan(d.xyz[2]) for d in self.drones):
                 return True
             time.sleep(0.1)
         return False

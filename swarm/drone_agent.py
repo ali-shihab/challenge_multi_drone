@@ -148,3 +148,9 @@ class DroneAgent(DroneInterface):
         """
         self._start("go_to", x, y, z, speed,
                     yaw_mode, yaw_angle, "earth", False)
+
+# [DRONEAGENT UNHOVER] applied: motion_ref_handler import, module
+# instantiation in __init__, and cmd_hover() method all removed.
+# Rationale: the module's constructor was disabling the
+# trajectory_generator at drone init, preventing even takeoff. See
+# patch_drone_agent_unhover.py.

@@ -348,6 +348,7 @@ class BoidsConductor:
         yaw_mode:     int   = YawMode.PATH_FACING,
         yaw_angle:    Optional[float] = None,
         timeout:      float = 60.0,
+        wait:         bool  = True,
     ) -> bool:
         """Fly the swarm to a formation centred on *centroid_xyz* using Boids.
 
@@ -379,6 +380,7 @@ class BoidsConductor:
         yaw_mode:  int   = YawMode.PATH_FACING,
         yaw_angle: Optional[float] = None,
         timeout:   float = 60.0,
+        wait:      bool  = True,
     ) -> bool:
         """Command each drone to an explicit [x, y, z] position via Boids."""
         if len(positions) != self.n:
@@ -466,10 +468,11 @@ class BoidsConductor:
         return False
 
     def wait_for_poses(self, timeout: float = 10.0) -> bool:
-        """Block until all drones have published a non-zero z pose."""
+        """Block until all drones have published at least one pose (z is not NaN)."""
+        import math
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if all(d.xyz[2] > 0.05 for d in self.drones):
+            if all(not math.isnan(d.xyz[2]) for d in self.drones):
                 return True
             time.sleep(0.1)
         return False

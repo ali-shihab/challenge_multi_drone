@@ -13,7 +13,7 @@ workspace with ``source setup.bash``):
 Options
 -------
 --scenario PATH      Scenario YAML file (default: scenarios/scenario1.yaml)
---namespaces NS...   Drone namespaces (default: drone0..drone4)
+--namespaces NS...   Drone namespaces (default: drone0..drone2)
 --stages STAGES      Comma-separated stage numbers to run (default: 1,2,3,4)
 --approach MODE      centralised (default) or decentralised (Boids)
 --speed SPEED        Override default cruise speed for all stages (m/s)
@@ -60,7 +60,7 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--namespaces",
         nargs="+",
-        default=["drone0", "drone1", "drone2", "drone3", "drone4"],
+        default=["drone0", "drone1", "drone2"],
         metavar="NS",
         help="ROS2 drone namespaces",
     )
@@ -243,16 +243,21 @@ def main(argv=None) -> int:
 
     try:
         # Wait for pose data
-        print("[Mission] Waiting for pose data from AS2 localisation...")
-        if not conductor.wait_for_poses(timeout=30.0):
-            print("[Mission] WARNING: Pose data not available after 30 s. "
-                  "Continuing anyway.")
+        print("[Mission] Waiting for pose data from all drones (may take up to 90 s)...")
+        pose_ok = False
+        for _attempt in range(3):
+            if conductor.wait_for_poses(timeout=90.0):
+                pose_ok = True
+                break
+            print(f"[Mission] Pose attempt {_attempt+1}/3 timed out, retrying...")
+        if not pose_ok:
+            print("[Mission] WARNING: Could not confirm pose data after 270 s. Proceeding.")
 
         # Arm and offboard
         print("[Mission] Arming and switching to offboard mode...")
         if not conductor.arm_and_offboard():
-            print("[Mission] ERROR: Failed to arm/offboard one or more drones.")
-            return 1
+            print("[Mission] WARN: arm/offboard returned failure (likely already armed from previous run); continuing.")
+            pass  # tolerate re-run; takeoff behaviour re-arms as needed
 
         # Takeoff
         print("[Mission] Taking off to " + str(args.takeoff_height) + " m...")

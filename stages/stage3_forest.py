@@ -44,11 +44,27 @@ from planners.path_utils import (
 # ---- tuneable parameters --------------------------------------------------
 
 FLIGHT_SPEED      = 0.5   # m/s  — slow through trees
-FLIGHT_HEIGHT_BASE = 1.2  # m  — nominal cruise altitude
-ALT_STEP          = 0.30  # m  — altitude separation between strata
-FORMATION_SPACING = 0.5   # m  — lateral offset between adjacent drones
+FLIGHT_HEIGHT_BASE = 1.2  # m  — nominal cruise altitude (shared centre)
+# [STAGE3 FANOUT] Tight altitude tier per drone (centred around
+# FLIGHT_HEIGHT_BASE). Breaks exact-cell conflicts where two A* paths
+# happen to share a narrow gap, without spreading so far that outer
+# drones skim the tree canopy. N=5 → z ∈ [1.00, 1.40] m.
+ALT_STEP          = 0.10  # m
+FORMATION_SPACING = 0.5   # m  — goal line-reform spacing (not ingress)
+# [STAGE3 FANOUT] Ingress lateral spread — drones start spread this far
+# apart perpendicular to the travel axis, so the entry line spans most
+# of the forest width and the swarm enters through distinct gaps.
+# N=5 → lateral offsets ≈ [-2.4, -1.2, 0.0, +1.2, +2.4] m.
+FANOUT_SPACING    = 1.2   # m
 GRID_RESOLUTION   = 0.20  # m  — A* grid resolution
 OBSTACLE_INFLATION = 0.35 # m  — safety radius added to each tree
+# Retained from the convoy patch: proximity-advance tolerance for
+# _fly_convoy. Used per-drone to skip the IDLE wait at each A* kink.
+CONVOY_SPACING    = 0.6   # m  — retained for API compat; unused by fanout
+CONVOY_ARRIVE_TOL = 0.35  # m
+# [STAGE3 FANOUT] Per-drone launch stagger (s) to prevent pile-up at
+# the entry row while drones accelerate to cruise.
+LAUNCH_STAGGER_S  = 0.4
 
 
 def _trees_to_aabb_obstacles(stage_cfg: Dict[str, Any]) -> List[Dict[str, float]]:
@@ -149,14 +165,50 @@ def _plan_drone_path(grid: OccupancyGrid3D,
 
 def _fly_path(drone, waypoints: List[List[float]],
               speed: float, verbose: bool) -> None:
-    """Command a single drone through a sequence of waypoints."""
+    """Legacy entry point — kept for compatibility. Delegates to
+    _fly_convoy with zero initial delay and the default proximity
+    tolerance."""
+    _fly_convoy(drone, waypoints, initial_delay_s=0.0, speed=speed)
+
+
+def _fly_convoy(drone, waypoints: List[List[float]],
+                initial_delay_s: float,
+                speed: float,
+                tol_m: float = CONVOY_ARRIVE_TOL,
+                per_wp_timeout: float = 30.0) -> None:
+    """[STAGE3 CONVOY] Fly a drone along a convoy path with a staggered
+    start and proximity-based advance between waypoints.
+
+    Each drone in the convoy uses the SAME path as the leader but delays
+    its first waypoint command by `initial_delay_s` seconds. This turns
+    column spacing into temporal separation, so when the path bends
+    around a tree every drone traces the same curve time-shifted.
+
+    Parameters
+    ----------
+    drone           : DroneAgent
+    waypoints       : list of [x, y, z] in world frame
+    initial_delay_s : seconds to wait before issuing the first cmd_goto
+                      (= drone_index * CONVOY_SPACING / speed)
+    speed           : go_to cruise speed (m/s)
+    tol_m           : XY proximity tolerance for advancing to next wp
+    per_wp_timeout  : per-waypoint safety timeout (s)
+    """
+    if initial_delay_s > 0.0:
+        time.sleep(initial_delay_s)
+    tol2 = tol_m * tol_m
     for wp in waypoints:
-        drone.cmd_goto(wp[0], wp[1], wp[2],
-                       speed=speed,
-                       yaw_mode=YawMode.PATH_FACING)
-        deadline = time.time() + 60.0
+        drone.cmd_goto(
+            wp[0], wp[1], wp[2],
+            speed=speed,
+            yaw_mode=YawMode.PATH_FACING,
+        )
+        deadline = time.time() + per_wp_timeout
         while time.time() < deadline:
-            if drone.behaviour_idle():
+            p = drone.xyz
+            dx = p[0] - wp[0]
+            dy = p[1] - wp[1]
+            if dx * dx + dy * dy < tol2:
                 break
             time.sleep(0.05)
 
@@ -166,19 +218,23 @@ def run_stage3(conductor: SwarmConductor,
                speed: float = FLIGHT_SPEED,
                spacing: float = FORMATION_SPACING,
                verbose: bool = True) -> None:
-    """Execute Stage 3: forest traversal.
+    """[STAGE3 FANOUT] Execute Stage 3: forest traversal with N parallel
+    A* paths and a wide lateral fan-out at ingress.
+
+    Supersedes the convoy approach. Each drone plans its own path through
+    the forest from a fanned-out start XY to a tightly-grouped goal XY.
+    Tight altitude staggering (ALT_STEP centred around FLIGHT_HEIGHT_BASE)
+    breaks exact-cell conflicts; per-drone launch staggering prevents
+    pile-up at the start row. Proximity-based waypoint advance via
+    _fly_convoy keeps each drone moving smoothly through the A* kinks.
 
     Parameters
     ----------
     conductor  : SwarmConductor
-    stage_cfg  : the 'stage3' dict from the scenario YAML, containing:
-                   stage_center   : [x, y]
-                   start_point    : [dx, dy]  relative to stage_center
-                   end_point      : [dx, dy]  relative to stage_center
-                   obstacle_diameter, obstacle_height
-                   obstacles      : list of [dx, dy] relative to stage_center
-    speed      : go_to speed for traversal (m/s)
-    spacing    : lateral inter-drone spacing (metres)
+    stage_cfg  : the 'stage3' dict from the scenario YAML
+    speed      : cruise speed (m/s)
+    spacing    : lateral spacing for the goal line reform (NOT ingress;
+                 ingress uses FANOUT_SPACING).
     verbose    : print progress messages
     """
     sc = stage_cfg["stage_center"]
@@ -190,106 +246,117 @@ def run_stage3(conductor: SwarmConductor,
     obstacles = _trees_to_aabb_obstacles(stage_cfg)
     n = conductor.n
 
-    # Heading from start to goal
+    # Travel axis (from YAML start to YAML goal). Perpendicular to this
+    # is the lateral axis along which we fan the drones out at ingress.
     dx = goal_xy[0] - start_xy[0]
     dy = goal_xy[1] - start_xy[1]
     heading = math.atan2(dy, dx)
+    perp_angle = heading + math.pi / 2.0
 
-    # Per-drone lateral offsets in the heading-aligned frame.
-    # FormationManager._line gives offsets [dx_local, dy_local] where
-    # dy_local is the lateral spread.  We use these dy values directly
-    # as the lateral distances to offset start/goal positions.
-    line_offsets = FormationManager.get_offsets("line", n, spacing)
-    lateral = [off[1] for off in line_offsets]
+    # Centred index in [-(n-1)/2 … +(n-1)/2]. For N=5: [-2, -1, 0, 1, 2].
+    def _ci(i: int) -> float:
+        return i - (n - 1) / 2.0
 
-    # Altitude staggering: drones in back half fly slightly higher to
-    # prevent path conflicts when routes converge in narrow corridors.
-    z_by_drone = [
-        FLIGHT_HEIGHT_BASE + (i // 2) * ALT_STEP
-        for i in range(n)
-    ]
+    # Per-drone lateral offsets at start (wide fanout) and at goal
+    # (tight reform spacing), plus per-drone altitude tier.
+    lateral_start = [_ci(i) * FANOUT_SPACING for i in range(n)]
+    lateral_goal  = [_ci(i) * spacing        for i in range(n)]
+    z_by_drone    = [FLIGHT_HEIGHT_BASE + _ci(i) * ALT_STEP
+                     for i in range(n)]
 
-    # Rotate lateral offset into world frame (perpendicular to heading)
-    perp_angle = heading + math.pi / 2.0   # perpendicular direction
-
-    starts = []
-    goals  = []
+    # Rotate lateral offsets into the world frame (perpendicular to
+    # heading) to build each drone's start and goal XYZ.
+    starts: List[List[float]] = []
+    goals:  List[List[float]] = []
     for i in range(n):
-        lat = lateral[i]
+        ls, lg = lateral_start[i], lateral_goal[i]
         starts.append([
-            start_xy[0] + lat * math.cos(perp_angle),
-            start_xy[1] + lat * math.sin(perp_angle),
+            start_xy[0] + ls * math.cos(perp_angle),
+            start_xy[1] + ls * math.sin(perp_angle),
             z_by_drone[i],
         ])
         goals.append([
-            goal_xy[0]  + lat * math.cos(perp_angle),
-            goal_xy[1]  + lat * math.sin(perp_angle),
+            goal_xy[0]  + lg * math.cos(perp_angle),
+            goal_xy[1]  + lg * math.sin(perp_angle),
             z_by_drone[i],
         ])
 
     if verbose:
         print(f"[Stage 3] Start {start_xy} → Goal {goal_xy}, "
               f"heading {math.degrees(heading):.1f}°, "
-              f"{len(obstacles)} trees, {n} drones.")
+              f"{len(obstacles)} trees, {n} drones (parallel A*).")
+        print(f"[Stage 3]   Ingress lateral fanout: "
+              f"{lateral_start[0]:+.2f} … {lateral_start[-1]:+.2f} m")
+        print(f"[Stage 3]   Altitude tiers: "
+              f"{min(z_by_drone):.2f} … {max(z_by_drone):.2f} m")
 
-    # Build a single shared occupancy grid
+    # --- Build a shared occupancy grid covering all drones' extents. ---
     grid = _build_grid(
         obstacles=obstacles,
         start_xyz=starts[0],
         goal_xyz=goals[0],
         n_drones=n,
-        lateral_offsets=lateral,
+        lateral_offsets=lateral_start,
         resolution=GRID_RESOLUTION,
         inflation=OBSTACLE_INFLATION,
     )
 
-    # Plan A* paths for every drone
-    paths = []
+    # --- Plan one A* per drone. ---
+    paths: List[List[List[float]]] = []
     for i in range(n):
         path = _plan_drone_path(grid, starts[i], goals[i])
         if path is None:
-            # Fallback: straight line if A* finds no path (should not happen
-            # with well-set inflation, but guards against edge cases)
             if verbose:
-                print(f"[Stage 3] WARNING: A* found no path for drone {i}, "
-                      "using straight-line fallback.")
+                print(f"[Stage 3] WARNING: A* found no path for drone {i}; "
+                      "using straight-line fallback. "
+                      "Raise OBSTACLE_INFLATION or FANOUT_SPACING.")
             path = [starts[i], goals[i]]
         else:
             if verbose:
                 print(f"[Stage 3]   Drone {i}: {len(path)} waypoints "
-                      f"(z ≈ {z_by_drone[i]:.2f} m)")
+                      f"(start x-offset {lateral_start[i]:+.2f} m, "
+                      f"z {z_by_drone[i]:.2f} m)")
         paths.append(path)
 
-    # --- Move swarm to their respective start positions ---
+    # --- Move each drone to its fanned-out start position. ---
     conductor.set_all_leds("green")
     if verbose:
-        print("[Stage 3] Moving to start positions…")
+        print("[Stage 3] Moving drones to fanned-out start positions…")
     conductor.goto_positions(
         positions=starts,
         speed=speed,
         yaw_mode=YawMode.PATH_FACING,
     )
 
-    # --- Execute planned paths concurrently ---
+    # --- Fire all drones in parallel, with small launch stagger. ---
     if verbose:
-        print("[Stage 3] Executing A* paths through forest…")
+        print(f"[Stage 3] Parallel traversal: stagger "
+              f"{LAUNCH_STAGGER_S:.2f} s/drone.")
     conductor.set_all_leds("cyan")
 
     import threading
 
-    def fly_drone(i):
-        _fly_path(conductor.drones[i], paths[i], speed, verbose=False)
+    def fly_member(i: int) -> None:
+        _fly_convoy(
+            conductor.drones[i],
+            waypoints=paths[i],
+            initial_delay_s=i * LAUNCH_STAGGER_S,
+            speed=speed,
+        )
 
-    threads = [threading.Thread(target=fly_drone, args=(i,), daemon=True)
-               for i in range(n)]
+    threads = [
+        threading.Thread(target=fly_member, args=(i,), daemon=True)
+        for i in range(n)
+    ]
     for t in threads:
         t.start()
+    max_t = (n - 1) * LAUNCH_STAGGER_S + 180.0
     for t in threads:
-        t.join(timeout=120.0)
+        t.join(timeout=max_t)
 
-    # --- Reform at goal ---
+    # --- Reform to a tight line at the goal (centred on YAML goal). ---
     if verbose:
-        print("[Stage 3] Reforming at goal position…")
+        print("[Stage 3] Reforming (line) at goal…")
     conductor.goto_formation(
         centroid_xyz=goal_xy + [FLIGHT_HEIGHT_BASE],
         heading_rad=heading,
@@ -301,3 +368,10 @@ def run_stage3(conductor: SwarmConductor,
 
     if verbose:
         print("[Stage 3] Complete.")
+
+# [STAGE3 FANOUT] applied: supersedes the convoy approach. Drones now
+# fan out laterally at ingress (FANOUT_SPACING = 1.2 m) and each plans
+# its own A* path through the forest, with tight altitude staggering
+# (ALT_STEP = 0.10 m) for cell-conflict breakage and a small per-drone
+# launch stagger (LAUNCH_STAGGER_S = 0.4 s). _fly_convoy is retained
+# unchanged. See patch_stage3_fanout.py rationale.

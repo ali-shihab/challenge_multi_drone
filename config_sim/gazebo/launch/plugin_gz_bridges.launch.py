@@ -45,7 +45,9 @@ def drone_bridges(context):
         # (f"/model/{namespace}/leds/status", "leds/status", "ignition.msgs.Float_V", "ros_gz_interfaces/msg/Float32Array"),
         # (f"/model/{namespace}/leds/control_individual", "leds/control_indvidual", "ignition.msgs.Float_V", "ros_gz_interfaces/msg/Float32Array"),
         (f"/model/{namespace}/leds/control", "leds/control", "ignition.msgs.Color", "std_msgs/msg/ColorRGBA"),
-        (f"/dynamic_obstacles/locations", "/dynamic_obstacles/locations", "gz.msgs.Pose", "geometry_msgs/msg/Pose")
+        # /dynamic_obstacles/locations is published directly as PoseStamped by
+        # scenario_runner (ROS2-side); no gz-to-ROS bridge is needed, and the
+        # gz Pose -> PoseStamped mapping isn't supported by ros_gz_bridge.
     ]
 
     nodes = []
